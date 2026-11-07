@@ -1,7 +1,7 @@
 // RUTA: app/admin/questions/page.tsx   (banco de preguntas del administrador)
 'use client'
 
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { createClient } from '@/lib/supabase/client'
 import Link from 'next/link'
 
@@ -36,6 +36,15 @@ interface QuestionItem {
 }
 
 const LETTERS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']
+const PAGE_SIZE = 20
+const MAX_IMAGE_MB = 5
+
+const defaultOptions = (): OptionInput[] => [
+  { letter: 'A', text: '', imageUrl: '', isCorrect: true },
+  { letter: 'B', text: '', imageUrl: '', isCorrect: false },
+  { letter: 'C', text: '', imageUrl: '', isCorrect: false },
+  { letter: 'D', text: '', imageUrl: '', isCorrect: false },
+]
 
 export default function AdminQuestionsPage() {
   const [activeTab, setActiveTab] = useState<'create' | 'list'>('create')
@@ -44,14 +53,23 @@ export default function AdminQuestionsPage() {
   const [selectedSubject, setSelectedSubject] = useState('all')
   const [newSubjectName, setNewSubjectName] = useState('')
 
-  // Estado para preguntas cargadas
+  // Estado para preguntas cargadas (SOLO la página actual)
   const [existingQuestions, setExistingQuestions] = useState<QuestionItem[]>([])
   const [loadingQuestions, setLoadingQuestions] = useState(false)
   const [searchQuery, setSearchQuery] = useState('')
+  const [debouncedSearch, setDebouncedSearch] = useState('')
   const [sortOrder, setSortOrder] = useState<'newest' | 'oldest'>('newest')
+
+  // Paginación en servidor
+  const [page, setPage] = useState(1)
+  const [totalCount, setTotalCount] = useState(0) // total con filtros (materia + búsqueda)
+  const [subjectCount, setSubjectCount] = useState(0) // total de la materia seleccionada
+  const [totalAll, setTotalAll] = useState(0) // total de todo el banco
+  const [refreshKey, setRefreshKey] = useState(0) // sube para forzar recarga
 
   // Estado del formulario de preguntas (Crear / Editar)
   const [editingQuestionId, setEditingQuestionId] = useState<string | null>(null)
+  const [originalOptionIds, setOriginalOptionIds] = useState<string[]>([])
   const [statement, setStatement] = useState('')
   const [questionImageUrl, setQuestionImageUrl] = useState('')
   const [explanation, setExplanation] = useState('')
@@ -61,12 +79,7 @@ export default function AdminQuestionsPage() {
   const [uploadingOptionIdx, setUploadingOptionIdx] = useState<number | null>(null)
 
   // Opciones iniciales
-  const [options, setOptions] = useState<OptionInput[]>([
-    { letter: 'A', text: '', imageUrl: '', isCorrect: true },
-    { letter: 'B', text: '', imageUrl: '', isCorrect: false },
-    { letter: 'C', text: '', imageUrl: '', isCorrect: false },
-    { letter: 'D', text: '', imageUrl: '', isCorrect: false },
-  ])
+  const [options, setOptions] = useState<OptionInput[]>(defaultOptions())
 
   // Modal de confirmación para eliminar materia
   const [showDeleteModal, setShowDeleteModal] = useState(false)
@@ -76,56 +89,22 @@ export default function AdminQuestionsPage() {
   const [loadingSubjects, setLoadingSubjects] = useState(true)
   const [submitting, setSubmitting] = useState(false)
 
-  const supabase = createClient()
+  // Cliente estable: no se recrea en cada render
+  const [supabase] = useState(() => createClient())
+
+  const requestIdRef = useRef(0)
+  const lastSearchRef = useRef('')
+  const listTopRef = useRef<HTMLDivElement | null>(null)
+
+  const reloadList = () => setRefreshKey((k) => k + 1)
 
   // Cargar Materias
   const loadSubjects = useCallback(async () => {
     setLoadingSubjects(true)
-    const { data } = await supabase.from('subjects').select('*').order('name')
-    if (data) {
-      setSubjects(data)
-    }
+    const { data, error } = await supabase.from('subjects').select('*').order('name')
+    if (error) console.error('Error cargando materias:', error)
+    if (data) setSubjects(data)
     setLoadingSubjects(false)
-  }, [supabase])
-
-  // Cargar Preguntas (Soporta 'all' o ID específico). Orden base: orden de subida.
-  const loadQuestionsBySubject = useCallback(async (subjectId: string) => {
-    setLoadingQuestions(true)
-    
-    let query = supabase
-      .from('questions')
-      .select(`
-        id,
-        statement,
-        image_url,
-        explanation,
-        subject_id,
-        created_at,
-        upload_position,
-        options (
-          id,
-          option_letter,
-          option_text,
-          option_image_url,
-          is_correct
-        )
-      `)
-      .order('upload_position', { ascending: false, nullsFirst: true })
-      .order('created_at', { ascending: false })
-
-    if (subjectId && subjectId !== 'all') {
-      query = query.eq('subject_id', subjectId)
-    }
-
-    const { data, error } = await query
-
-    if (!error && data) {
-      setExistingQuestions(data as unknown as QuestionItem[])
-    } else {
-      console.error('Error cargando preguntas:', error)
-      setExistingQuestions([])
-    }
-    setLoadingQuestions(false)
   }, [supabase])
 
   // Cargar materias en el montaje inicial
@@ -133,36 +112,160 @@ export default function AdminQuestionsPage() {
     let isMounted = true
 
     const fetchInitialSubjects = async () => {
-      setLoadingSubjects(true)
-      const { data } = await supabase.from('subjects').select('*').order('name')
-      if (isMounted && data) {
-        setSubjects(data)
-        setSelectedSubject('all')
-        setLoadingSubjects(false)
-      }
+      const { data, error } = await supabase.from('subjects').select('*').order('name')
+      if (!isMounted) return
+      if (error) console.error('Error cargando materias:', error)
+      if (data) setSubjects(data)
+      setLoadingSubjects(false)
     }
 
     fetchInitialSubjects()
 
-    return () => { isMounted = false }
+    return () => {
+      isMounted = false
+    }
   }, [supabase])
 
-  // Reactividad asíncrona corregida para evitar advertencias de cascading render
+  // Debounce de la búsqueda (400 ms) y regreso a la página 1
+  useEffect(() => {
+    const term = searchQuery.trim()
+    if (term === lastSearchRef.current) return
+    const t = setTimeout(() => {
+      lastSearchRef.current = term
+      setDebouncedSearch(term)
+      setPage(1)
+    }, 400)
+    return () => clearTimeout(t)
+  }, [searchQuery])
+
+  // Conteos reales (total del banco y total de la materia seleccionada)
   useEffect(() => {
     let isMounted = true
 
-    const fetchQuestions = async () => {
-      if (isMounted) {
-        await loadQuestionsBySubject(selectedSubject)
+    const fetchCounts = async () => {
+      const { count: all } = await supabase
+        .from('questions')
+        .select('*', { count: 'exact', head: true })
+      if (!isMounted) return
+      setTotalAll(all ?? 0)
+
+      if (selectedSubject === 'all') {
+        setSubjectCount(all ?? 0)
+      } else {
+        const { count: sub } = await supabase
+          .from('questions')
+          .select('*', { count: 'exact', head: true })
+          .eq('subject_id', selectedSubject)
+        if (isMounted) setSubjectCount(sub ?? 0)
       }
     }
 
-    fetchQuestions()
+    fetchCounts()
 
     return () => {
       isMounted = false
     }
-  }, [selectedSubject, loadQuestionsBySubject])
+  }, [supabase, selectedSubject, refreshKey])
+
+  // Cargar la página actual de preguntas (filtro por materia + búsqueda + orden en servidor)
+  useEffect(() => {
+    const reqId = ++requestIdRef.current
+
+    const fetchQuestions = async () => {
+      setLoadingQuestions(true)
+
+      const from = (page - 1) * PAGE_SIZE
+      const to = from + PAGE_SIZE - 1
+      const asc = sortOrder === 'oldest'
+
+      let query = supabase
+        .from('questions')
+        .select(
+          `
+          id,
+          statement,
+          image_url,
+          explanation,
+          subject_id,
+          created_at,
+          upload_position,
+          options (
+            id,
+            option_letter,
+            option_text,
+            option_image_url,
+            is_correct
+          )
+        `,
+          { count: 'exact' }
+        )
+        .order('upload_position', { ascending: asc, nullsFirst: asc })
+        .order('created_at', { ascending: asc })
+        .order('id', { ascending: asc }) // desempate estable para paginar
+        .range(from, to)
+
+      if (selectedSubject && selectedSubject !== 'all') {
+        query = query.eq('subject_id', selectedSubject)
+      }
+
+      if (debouncedSearch) {
+        const numeric = debouncedSearch.replace('#', '')
+        if (/^\d{1,9}$/.test(numeric)) {
+          // Número: coincide con el número de pregunta o aparece en el texto
+          query = query.or(`upload_position.eq.${numeric},statement.ilike.%${numeric}%`)
+        } else {
+          // Texto: se escapan los comodines de LIKE para buscar literalmente
+          const escaped = debouncedSearch.replace(/[\\%_]/g, '\\$&')
+          query = query.ilike('statement', `%${escaped}%`)
+        }
+      }
+
+      const { data, error, count } = await query
+
+      // Respuesta vieja: la ignoramos, ya hay una más reciente en camino
+      if (reqId !== requestIdRef.current) return
+
+      if (error) {
+        // Página fuera de rango (ej. se borró la última): volver a la 1
+        if (error.code === 'PGRST103' && page > 1) {
+          setPage(1)
+          return
+        }
+        console.error('Error cargando preguntas:', error)
+        setExistingQuestions([])
+        setTotalCount(0)
+        setLoadingQuestions(false)
+        return
+      }
+
+      const total = count ?? 0
+
+      // Si la página quedó vacía pero hay resultados, ir a la última página válida
+      if ((data?.length ?? 0) === 0 && total > 0 && page > 1) {
+        setPage(Math.ceil(total / PAGE_SIZE))
+        return
+      }
+
+      setExistingQuestions((data ?? []) as unknown as QuestionItem[])
+      setTotalCount(total)
+      setLoadingQuestions(false)
+    }
+
+    fetchQuestions()
+  }, [supabase, selectedSubject, page, debouncedSearch, sortOrder, refreshKey])
+
+  // Validación de archivos de imagen
+  const validateImageFile = (file: File): boolean => {
+    if (!file.type.startsWith('image/')) {
+      alert('El archivo debe ser una imagen.')
+      return false
+    }
+    if (file.size > MAX_IMAGE_MB * 1024 * 1024) {
+      alert(`La imagen supera el límite de ${MAX_IMAGE_MB} MB.`)
+      return false
+    }
+    return true
+  }
 
   // Subir archivo a Supabase Storage
   const uploadImageToStorage = async (file: File): Promise<string | null> => {
@@ -189,6 +292,7 @@ export default function AdminQuestionsPage() {
   }
 
   const handleQuestionImageUpload = async (file: File) => {
+    if (!validateImageFile(file)) return
     setUploadingQuestionImg(true)
     const url = await uploadImageToStorage(file)
     if (url) setQuestionImageUrl(url)
@@ -196,48 +300,53 @@ export default function AdminQuestionsPage() {
   }
 
   const handleOptionImageUpload = async (index: number, file: File) => {
+    if (!validateImageFile(file)) return
     setUploadingOptionIdx(index)
     const url = await uploadImageToStorage(file)
     if (url) {
-      const updated = [...options]
-      updated[index].imageUrl = url
-      setOptions(updated)
+      setOptions((prev) => prev.map((o, i) => (i === index ? { ...o, imageUrl: url } : o)))
     }
     setUploadingOptionIdx(null)
   }
 
   const addOption = () => {
-    if (options.length >= LETTERS.length) return
-    const nextLetter = LETTERS[options.length]
-    setOptions([...options, { letter: nextLetter, text: '', imageUrl: '', isCorrect: false }])
+    setOptions((prev) => {
+      if (prev.length >= LETTERS.length) return prev
+      return [
+        ...prev,
+        { letter: LETTERS[prev.length], text: '', imageUrl: '', isCorrect: false },
+      ]
+    })
   }
 
   const removeOption = () => {
-    if (options.length <= 2) return
-    const newOptions = options.slice(0, -1)
-    if (!newOptions.some((o) => o.isCorrect)) {
-      newOptions[0].isCorrect = true
-    }
-    setOptions(newOptions)
+    setOptions((prev) => {
+      if (prev.length <= 2) return prev
+      const next = prev.slice(0, -1).map((o) => ({ ...o }))
+      if (!next.some((o) => o.isCorrect)) {
+        next[0].isCorrect = true
+      }
+      return next
+    })
   }
 
   const handleOptionTextChange = (index: number, text: string) => {
-    const updated = [...options]
-    updated[index].text = text
-    setOptions(updated)
+    setOptions((prev) => prev.map((o, i) => (i === index ? { ...o, text } : o)))
+  }
+
+  const handleRemoveOptionImage = (index: number) => {
+    setOptions((prev) => prev.map((o, i) => (i === index ? { ...o, imageUrl: '' } : o)))
   }
 
   const handleSetCorrect = (index: number) => {
-    const updated = options.map((opt, i) => ({
-      ...opt,
-      isCorrect: i === index,
-    }))
-    setOptions(updated)
+    setOptions((prev) => prev.map((opt, i) => ({ ...opt, isCorrect: i === index })))
   }
 
   // Cargar datos en el formulario para editar
   const handleEditQuestion = (question: QuestionItem) => {
     setEditingQuestionId(question.id)
+    // Guardamos los ids originales: la lista paginada puede cambiar mientras se edita
+    setOriginalOptionIds(question.options?.map((o) => o.id) ?? [])
     setStatement(question.statement)
     setQuestionImageUrl(question.image_url || '')
     setExplanation(question.explanation || '')
@@ -267,15 +376,30 @@ export default function AdminQuestionsPage() {
   // Cancelar Edición / Limpiar Formulario
   const resetForm = () => {
     setEditingQuestionId(null)
+    setOriginalOptionIds([])
     setStatement('')
     setQuestionImageUrl('')
     setExplanation('')
-    setOptions([
-      { letter: 'A', text: '', imageUrl: '', isCorrect: true },
-      { letter: 'B', text: '', imageUrl: '', isCorrect: false },
-      { letter: 'C', text: '', imageUrl: '', isCorrect: false },
-      { letter: 'D', text: '', imageUrl: '', isCorrect: false },
-    ])
+    setOptions(defaultOptions())
+  }
+
+  // Cambio de materia desde el selector
+  const handleSubjectChange = (value: string) => {
+    setSelectedSubject(value)
+    setPage(1)
+    resetForm()
+  }
+
+  // Cambio de orden
+  const handleSortChange = (value: 'newest' | 'oldest') => {
+    setSortOrder(value)
+    setPage(1)
+  }
+
+  // Cambio de página (con scroll al inicio de la lista)
+  const goToPage = (p: number) => {
+    setPage(p)
+    listTopRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   }
 
   // Eliminar una pregunta
@@ -292,7 +416,7 @@ export default function AdminQuestionsPage() {
       )
     } else {
       alert('Pregunta eliminada con éxito.')
-      loadQuestionsBySubject(selectedSubject)
+      reloadList()
     }
   }
 
@@ -313,6 +437,7 @@ export default function AdminQuestionsPage() {
       setNewSubjectName('')
       await loadSubjects()
       setSelectedSubject(data.id)
+      setPage(1)
     }
   }
 
@@ -323,7 +448,9 @@ export default function AdminQuestionsPage() {
 
     setDeletingSubject(true)
 
-    const { data: { user } } = await supabase.auth.getUser()
+    const {
+      data: { user },
+    } = await supabase.auth.getUser()
     if (!user?.email) {
       alert('Error obteniendo datos del usuario activo.')
       setDeletingSubject(false)
@@ -353,7 +480,9 @@ export default function AdminQuestionsPage() {
       setShowDeleteModal(false)
       setAdminPassword('')
       setSelectedSubject('all')
+      setPage(1)
       await loadSubjects()
+      reloadList()
     }
 
     setDeletingSubject(false)
@@ -368,6 +497,11 @@ export default function AdminQuestionsPage() {
     }
     if (!statement.trim()) {
       alert('Escribe el enunciado de la pregunta.')
+      return
+    }
+    const emptyOption = options.find((o) => !o.text.trim() && !o.imageUrl.trim())
+    if (emptyOption) {
+      alert(`La opción ${emptyOption.letter} no tiene texto ni imagen.`)
       return
     }
 
@@ -394,13 +528,10 @@ export default function AdminQuestionsPage() {
       }
 
       // EDICIÓN SEGURA DE OPCIONES:
-      // Ya no se borran y recrean todas (eso rompía las respuestas de estudiantes
-      // que apuntan a esas opciones). Se actualizan las existentes por id,
-      // se insertan las nuevas y solo se borran las que el admin quitó.
-      const originalQuestion = existingQuestions.find((q) => q.id === editingQuestionId)
-      const originalIds = originalQuestion?.options.map((o) => o.id) ?? []
+      // Se actualizan las existentes por id, se insertan las nuevas y solo
+      // se borran las que el admin quitó (para no romper respuestas de estudiantes).
       const keptIds = options.filter((o) => o.id).map((o) => o.id as string)
-      const idsToDelete = originalIds.filter((id) => !keptIds.includes(id))
+      const idsToDelete = originalOptionIds.filter((id) => !keptIds.includes(id))
 
       let optionsError: string | null = null
 
@@ -408,24 +539,26 @@ export default function AdminQuestionsPage() {
         const { error: delErr } = await supabase.from('options').delete().in('id', idsToDelete)
         if (delErr) {
           optionsError =
-            'No se pudieron quitar algunas opciones porque ya fueron respondidas por estudiantes. Se dejaron como estaban.'
+            'No se pudieron quitar algunas opciones porque ya fueron respondidas por estudiantes. Se dejaron como estaban y no se agregaron opciones nuevas.'
         }
       }
 
-      for (const opt of options.filter((o) => o.id)) {
-        const { error: updErr } = await supabase
-          .from('options')
-          .update({
-            option_letter: opt.letter,
-            option_text: opt.text.trim() || null,
-            option_image_url: opt.imageUrl.trim() || null,
-            is_correct: opt.isCorrect,
-          })
-          .eq('id', opt.id as string)
+      if (!optionsError) {
+        for (const opt of options.filter((o) => o.id)) {
+          const { error: updErr } = await supabase
+            .from('options')
+            .update({
+              option_letter: opt.letter,
+              option_text: opt.text.trim() || null,
+              option_image_url: opt.imageUrl.trim() || null,
+              is_correct: opt.isCorrect,
+            })
+            .eq('id', opt.id as string)
 
-        if (updErr) {
-          optionsError = `Error al actualizar la opción ${opt.letter}: ${updErr.message}`
-          break
+          if (updErr) {
+            optionsError = `Error al actualizar la opción ${opt.letter}: ${updErr.message}`
+            break
+          }
         }
       }
 
@@ -450,7 +583,7 @@ export default function AdminQuestionsPage() {
         alert('¡Pregunta actualizada con éxito!')
       }
       resetForm()
-      loadQuestionsBySubject(selectedSubject)
+      reloadList()
     } else {
       // El número de orden de subida (upload_position) lo asigna la base de datos solo
       const { data: questionData, error: qError } = await supabase
@@ -476,31 +609,78 @@ export default function AdminQuestionsPage() {
       const { error: optError } = await supabase.from('options').insert(optionsPayload)
 
       if (optError) {
-        alert(`Error al guardar las opciones: ${optError.message}`)
+        // Rollback: no dejar la pregunta huérfana (sin opciones)
+        await supabase.from('questions').delete().eq('id', questionData.id)
+        alert(`Error al guardar las opciones: ${optError.message}\n\nLa pregunta no se guardó. Intenta de nuevo.`)
       } else {
         alert('¡Pregunta guardada con éxito!')
         resetForm()
-        loadQuestionsBySubject(selectedSubject)
+        reloadList()
       }
     }
 
     setSubmitting(false)
   }
 
-  // Filtro por texto (o por número de pregunta, ej: "25" o "#25") + orden de subida
-  const filteredQuestionsList = existingQuestions
-    .filter((q) => {
-      const term = searchQuery.trim().toLowerCase()
-      if (!term) return true
-      const numeric = term.replace('#', '')
-      if (/^\d+$/.test(numeric) && q.upload_position === Number(numeric)) return true
-      return q.statement.toLowerCase().includes(term)
-    })
-    .sort((a, b) => {
-      const pa = a.upload_position ?? 0
-      const pb = b.upload_position ?? 0
-      return sortOrder === 'newest' ? pb - pa : pa - pb
-    })
+  // Datos de paginación para mostrar
+  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
+  const rangeFrom = totalCount === 0 ? 0 : (page - 1) * PAGE_SIZE + 1
+  const rangeTo = Math.min(page * PAGE_SIZE, totalCount)
+
+  const paginationControls = totalCount > PAGE_SIZE && (
+    <div className="flex flex-wrap items-center justify-center gap-2">
+      <button
+        type="button"
+        onClick={() => goToPage(1)}
+        disabled={page <= 1 || loadingQuestions}
+        className="px-3 py-1.5 bg-slate-950 border border-slate-800 text-slate-300 font-bold text-xs rounded-xl disabled:opacity-40 hover:border-orange-500/50 transition-all"
+      >
+        « Primera
+      </button>
+      <button
+        type="button"
+        onClick={() => goToPage(page - 1)}
+        disabled={page <= 1 || loadingQuestions}
+        className="px-3 py-1.5 bg-slate-950 border border-slate-800 text-slate-300 font-bold text-xs rounded-xl disabled:opacity-40 hover:border-orange-500/50 transition-all"
+      >
+        ← Anterior
+      </button>
+
+      <div className="flex items-center gap-2 text-xs font-bold text-slate-400">
+        <span>Página</span>
+        <select
+          value={page}
+          onChange={(e) => goToPage(Number(e.target.value))}
+          disabled={loadingQuestions}
+          className="bg-slate-950 border border-slate-800 rounded-xl px-2 py-1.5 text-xs text-white focus:outline-none focus:border-orange-500 cursor-pointer"
+        >
+          {Array.from({ length: totalPages }, (_, i) => i + 1).map((p) => (
+            <option key={p} value={p}>
+              {p}
+            </option>
+          ))}
+        </select>
+        <span>de {totalPages}</span>
+      </div>
+
+      <button
+        type="button"
+        onClick={() => goToPage(page + 1)}
+        disabled={page >= totalPages || loadingQuestions}
+        className="px-3 py-1.5 bg-slate-950 border border-slate-800 text-slate-300 font-bold text-xs rounded-xl disabled:opacity-40 hover:border-orange-500/50 transition-all"
+      >
+        Siguiente →
+      </button>
+      <button
+        type="button"
+        onClick={() => goToPage(totalPages)}
+        disabled={page >= totalPages || loadingQuestions}
+        className="px-3 py-1.5 bg-slate-950 border border-slate-800 text-slate-300 font-bold text-xs rounded-xl disabled:opacity-40 hover:border-orange-500/50 transition-all"
+      >
+        Última »
+      </button>
+    </div>
+  )
 
   return (
     <div className="relative min-h-screen bg-slate-950 text-slate-100 p-4 md:p-8 selection:bg-orange-500 selection:text-white font-sans">
@@ -551,13 +731,10 @@ export default function AdminQuestionsPage() {
                 <div className="flex gap-2">
                   <select
                     value={selectedSubject}
-                    onChange={(e) => {
-                      setSelectedSubject(e.target.value)
-                      resetForm()
-                    }}
+                    onChange={(e) => handleSubjectChange(e.target.value)}
                     className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-xs text-white focus:outline-none focus:border-orange-500 cursor-pointer"
                   >
-                    <option value="all">🌐 Todas las materias ({existingQuestions.length} preguntas)</option>
+                    <option value="all">🌐 Todas las materias ({totalAll} preguntas)</option>
                     {subjects.map((item) => (
                       <option key={item.id} value={item.id}>
                         {item.name}
@@ -620,7 +797,7 @@ export default function AdminQuestionsPage() {
           >
             <span>📋 Preguntas Guardadas</span>
             <span className="px-2 py-0.5 bg-slate-950/80 text-white rounded-md text-[10px] font-black">
-              {existingQuestions.length}
+              {subjectCount}
             </span>
           </button>
         </div>
@@ -707,7 +884,11 @@ export default function AdminQuestionsPage() {
                       <input
                         type="file"
                         accept="image/*"
-                        onChange={(e) => e.target.files?.[0] && handleQuestionImageUpload(e.target.files[0])}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0]
+                          if (file) handleQuestionImageUpload(file)
+                          e.target.value = ''
+                        }}
                         className="hidden"
                         id="question-img-input"
                       />
@@ -806,11 +987,7 @@ export default function AdminQuestionsPage() {
                             <img src={opt.imageUrl} alt={`Opción ${opt.letter}`} className="h-8 rounded" />
                             <button
                               type="button"
-                              onClick={() => {
-                                const updated = [...options]
-                                updated[idx].imageUrl = ''
-                                setOptions(updated)
-                              }}
+                              onClick={() => handleRemoveOptionImage(idx)}
                               className="text-[10px] text-rose-400 font-bold"
                             >
                               Quitar
@@ -822,7 +999,11 @@ export default function AdminQuestionsPage() {
                             <input
                               type="file"
                               accept="image/*"
-                              onChange={(e) => e.target.files?.[0] && handleOptionImageUpload(idx, e.target.files[0])}
+                              onChange={(e) => {
+                                const file = e.target.files?.[0]
+                                if (file) handleOptionImageUpload(idx, file)
+                                e.target.value = ''
+                              }}
                               className="hidden"
                               id={`opt-img-${idx}`}
                             />
@@ -854,7 +1035,7 @@ export default function AdminQuestionsPage() {
 
         {/* PESTAÑA 2: VISOR / LISTA DE PREGUNTAS GUARDADAS */}
         {activeTab === 'list' && (
-          <div className="bg-slate-900/90 border border-slate-800 rounded-3xl p-6 shadow-xl backdrop-blur-xl space-y-4">
+          <div ref={listTopRef} className="bg-slate-900/90 border border-slate-800 rounded-3xl p-6 shadow-xl backdrop-blur-xl space-y-4 scroll-mt-4">
             
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 pb-4 border-b border-slate-800">
               <div className="flex flex-col sm:flex-row gap-2 w-full lg:max-w-xl">
@@ -867,7 +1048,7 @@ export default function AdminQuestionsPage() {
                 />
                 <select
                   value={sortOrder}
-                  onChange={(e) => setSortOrder(e.target.value as 'newest' | 'oldest')}
+                  onChange={(e) => handleSortChange(e.target.value as 'newest' | 'oldest')}
                   className="bg-slate-950 border border-slate-800 rounded-xl px-3 py-2 text-xs text-white focus:outline-none focus:border-orange-500 cursor-pointer shrink-0"
                 >
                   <option value="newest">↓ Más recientes primero</option>
@@ -875,16 +1056,18 @@ export default function AdminQuestionsPage() {
                 </select>
               </div>
               <span className="text-xs font-bold text-slate-400">
-                Mostrando {filteredQuestionsList.length} de {existingQuestions.length}
+                Mostrando {rangeFrom}-{rangeTo} de {totalCount}
               </span>
             </div>
+
+            {paginationControls}
 
             {loadingQuestions ? (
               <div className="text-center py-12 space-y-2">
                 <div className="w-6 h-6 border-2 border-orange-500 border-t-transparent rounded-full animate-spin mx-auto" />
                 <p className="text-xs text-slate-400 font-semibold">Cargando preguntas...</p>
               </div>
-            ) : filteredQuestionsList.length === 0 ? (
+            ) : existingQuestions.length === 0 ? (
               <div className="text-center py-12 space-y-2 border-2 border-dashed border-slate-800 rounded-2xl">
                 <p className="text-2xl">📭</p>
                 <p className="text-xs font-bold text-slate-300">No hay preguntas registradas con este filtro</p>
@@ -892,7 +1075,7 @@ export default function AdminQuestionsPage() {
               </div>
             ) : (
               <div className="space-y-4">
-                {filteredQuestionsList.map((q) => (
+                {existingQuestions.map((q) => (
                   <div key={q.id} className="p-5 bg-slate-950 border border-slate-800 rounded-2xl space-y-3">
                     
                     {/* Encabezado de Pregunta */}
@@ -985,6 +1168,8 @@ export default function AdminQuestionsPage() {
                 ))}
               </div>
             )}
+
+            {!loadingQuestions && existingQuestions.length > 0 && paginationControls}
 
           </div>
         )}
