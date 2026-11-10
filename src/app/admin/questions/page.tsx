@@ -199,7 +199,7 @@ export default function AdminQuestionsPage() {
         `,
           { count: 'exact' }
         )
-        .order('upload_position', { ascending: asc, nullsFirst: asc })
+        .order('upload_position', { ascending: asc, nullsFirst: !asc })
         .order('created_at', { ascending: asc })
         .order('id', { ascending: asc }) // desempate estable para paginar
         .range(from, to)
